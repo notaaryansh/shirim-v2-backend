@@ -22,11 +22,12 @@ STEP_DEFS: list[tuple[str, str]] = [
 # Sentinel return values from _active_index.
 _SUCCESS = -1
 _FAILED = -2
+_CANCELLED = -3
 
 
 def _active_index(status: str, phase: str | None) -> int:
     """Map the runner's (status, phase) to the currently-active step index,
-    or a sentinel (_SUCCESS / _FAILED)."""
+    or a sentinel (_SUCCESS / _FAILED / _CANCELLED)."""
     if status in ("pending", "cloning"):
         return 0
     if status == "analyzing":
@@ -37,6 +38,8 @@ def _active_index(status: str, phase: str | None) -> int:
         return 3 if phase in ("run", "fix") else 2
     if status == "success":
         return _SUCCESS
+    if status == "cancelled":
+        return _CANCELLED
     # failure, timeout, error
     return _FAILED
 
@@ -75,18 +78,20 @@ def _overall(status: str) -> str:
         return "pending"
     if status == "success":
         return "success"
+    if status == "cancelled":
+        return "cancelled"
     if status in ("failure", "timeout", "error"):
         return "failure"
     return "running"
 
 
 def _extract_error(run: Any) -> dict | None:
-    if run.status not in ("failure", "timeout", "error"):
+    if run.status not in ("failure", "timeout", "cancelled", "error"):
         return None
     # Walk backwards for the most recent terminal event.
     for entry in reversed(run.logs):
         t = entry.get("type")
-        if t in ("failure", "timeout", "error"):
+        if t in ("failure", "timeout", "cancelled", "error"):
             return {
                 "reason": entry.get("reason") or entry.get("msg") or run.status,
                 "last_error": entry.get("last_error"),
@@ -122,6 +127,19 @@ def compute_progress(run: Any) -> dict:
             # later steps stay pending
         current_step_id = steps[fail_idx]["id"]
         current_step_index = fail_idx
+    elif active == _CANCELLED:
+        # Same shape as failed — whichever step was active becomes failed,
+        # earlier steps stay done, later steps stay pending. The distinction
+        # for the UI is in the top-level overall_status which will be
+        # "cancelled", so the frontend can show a different colour/label.
+        cancel_idx = _infer_failed_index(run)
+        for i, s in enumerate(steps):
+            if i < cancel_idx:
+                s["status"] = "done"
+            elif i == cancel_idx:
+                s["status"] = "failed"
+        current_step_id = steps[cancel_idx]["id"]
+        current_step_index = cancel_idx
     else:
         for i in range(active):
             steps[i]["status"] = "done"

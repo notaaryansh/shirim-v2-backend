@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import FRONTEND_ORIGINS
 from .routes import auth as auth_routes
 from .routes import install as install_routes
+from .routes import launch as launch_routes
 from .routes import repos
 from .routes import search as search_routes
 
@@ -24,6 +25,7 @@ app.add_middleware(
 app.include_router(repos.router, prefix="/api")
 app.include_router(auth_routes.router, prefix="/api")
 app.include_router(install_routes.router, prefix="/api")
+app.include_router(launch_routes.router, prefix="/api")
 app.include_router(search_routes.router, prefix="/api")
 
 

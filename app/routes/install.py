@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ..agent.launcher import stop_runs_for_install
 from ..agent.progress import compute_progress
 from ..agent.runner import AgentRun
 from ..agent.sandbox import INSTALLS_DIR, cleanup_install
@@ -23,6 +24,11 @@ router = APIRouter(prefix="/v1/install", tags=["install"])
 # In-memory registry of in-flight + recently-finished installs.
 # Lost on process restart — that's an accepted v1 limitation.
 _installs: dict[str, AgentRun] = {}
+_tasks: dict[str, asyncio.Task] = {}  # install_id → background run task
+
+
+def _is_terminal(run: AgentRun) -> bool:
+    return run.status in ("success", "failure", "timeout", "cancelled", "error")
 
 
 class InstallRequest(BaseModel):
@@ -36,6 +42,21 @@ async def start_install(
     body: InstallRequest | None = None,
     user: User = Depends(get_current_user),
 ):
+    # Dedup: if the same user already has a non-terminal install for this
+    # exact repo, return the existing install_id. Prevents React StrictMode
+    # double-invocation and accidental double-clicks from spawning zombies.
+    for existing_id, existing in _installs.items():
+        if (
+            existing.owner == owner
+            and existing.repo == repo
+            and not _is_terminal(existing)
+        ):
+            log.info(
+                "dedup: returning existing install %s for %s/%s",
+                existing_id, owner, repo,
+            )
+            return {"install_id": existing_id, "deduped": True}
+
     install_id = uuid.uuid4().hex[:12]
     run = AgentRun(
         install_id=install_id,
@@ -44,8 +65,8 @@ async def start_install(
         ref=(body.ref if body else None),
     )
     _installs[install_id] = run
-    # Fire and forget — the loop writes to run.logs/run.status.
-    asyncio.create_task(run.run())
+    # Store the task handle so cancel can reach it.
+    _tasks[install_id] = asyncio.create_task(run.run())
     return {"install_id": install_id}
 
 
@@ -109,10 +130,54 @@ async def stream_install(install_id: str, user: User = Depends(get_current_user)
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+@router.post("/{install_id}/cancel")
+async def cancel_install(install_id: str, user: User = Depends(get_current_user)):
+    """Soft cancel — sets the runner's cancel flag and cancels the asyncio Task.
+
+    Keeps the workdir around for post-mortem inspection. Use DELETE if you
+    also want the files wiped.
+    """
+    run = _installs.get(install_id)
+    if not run:
+        raise HTTPException(404, "install not found")
+    if _is_terminal(run):
+        return {"ok": True, "already_terminal": True, "status": run.status}
+
+    run.request_cancel()
+    task = _tasks.get(install_id)
+    if task and not task.done():
+        task.cancel()
+        # Give the runner a short window to observe the cancel flag and
+        # shut down cleanly. We don't await task.wait() because the caller
+        # is polling /progress anyway.
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+    return {"ok": True, "status": run.status}
+
+
 @router.delete("/{install_id}")
 async def delete_install(install_id: str, user: User = Depends(get_current_user)):
+    """Cancel (if running), stop any active launched process, then wipe the workdir."""
     run = _installs.pop(install_id, None)
+    task = _tasks.pop(install_id, None)
+
+    if run and not _is_terminal(run):
+        run.request_cancel()
+    if task and not task.done():
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=3)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
+    # Stop any live launched subprocess before we rm the workdir out from under it.
+    stopped_runs = await asyncio.to_thread(stop_runs_for_install, install_id)
+    if stopped_runs:
+        log.info("stopped %d running process(es) for %s", stopped_runs, install_id)
+
     removed = cleanup_install(install_id)
     if not run and not removed:
         raise HTTPException(404, "install not found")
-    return {"ok": True, "removed": removed}
+    return {"ok": True, "removed": removed, "stopped_runs": stopped_runs}

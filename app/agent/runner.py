@@ -42,16 +42,32 @@ class AgentRun:
     ref: str | None = None
     workdir: Path = field(init=False)
 
-    status: str = "pending"  # pending | cloning | analyzing | sandboxing | running | success | failure | timeout | error
+    status: str = "pending"  # pending | cloning | analyzing | sandboxing | running | success | failure | timeout | cancelled | error
     phase: str | None = None  # install | run | fix
     analysis: dict | None = None
     result: dict | None = None
     logs: list[dict] = field(default_factory=list)
     started_at: float = 0.0
     finished_at: float = 0.0
+    cancel_requested: bool = False
 
     def __post_init__(self) -> None:
         self.workdir = INSTALLS_DIR / self.install_id
+
+    def request_cancel(self) -> None:
+        """Cooperative cancel. Flag is checked at safe points in the loop."""
+        self.cancel_requested = True
+        self.log_event("cancel_requested")
+
+    def _check_cancel(self) -> bool:
+        """Return True and mark status if cancel was requested."""
+        if self.cancel_requested and self.status not in (
+            "success", "failure", "timeout", "cancelled", "error"
+        ):
+            self.status = "cancelled"
+            self.log_event("cancelled", reason="cancel requested by user")
+            return True
+        return False
 
     # -------------------- logging helpers --------------------
 
@@ -69,6 +85,14 @@ class AgentRun:
         self.started_at = time.time()
         try:
             await self._run_inner()
+        except asyncio.CancelledError:
+            # Either .cancel() was called on our task, or a subprocess was
+            # interrupted. Record it cleanly and do NOT re-raise — we want the
+            # finally block to still write result files and the poller to see
+            # status=cancelled instead of an orphan task.
+            log.info("agent run cancelled: %s", self.install_id)
+            self.status = "cancelled"
+            self.log_event("cancelled", reason="task cancelled")
         except Exception as e:
             log.exception("agent run crashed")
             self.status = "error"
@@ -83,6 +107,8 @@ class AgentRun:
         self.status = "cloning"
         self.log_event("status", msg=f"cloning {self.owner}/{self.repo}")
         await clone_repo(self.owner, self.repo, self.workdir, ref=self.ref)
+        if self._check_cancel():
+            return
 
         # Stage 2 — deterministic analysis
         self.status = "analyzing"
@@ -117,6 +143,8 @@ class AgentRun:
             return
         for note in sandbox_info.notes:
             self.log_event("sandbox", note=note)
+        if self._check_cancel():
+            return
 
         # Stage 4 — LLM loop
         if OPENAI_CLIENT is None:
@@ -163,6 +191,8 @@ class AgentRun:
         fix_stderr_hashes: list[str] = []
 
         for iteration in range(1, MAX_ITERATIONS + 1):
+            if self._check_cancel():
+                return
             if time.time() - self.started_at > WALL_CLOCK_SECONDS:
                 self.status = "timeout"
                 self.log_event("timeout", reason=f"wall clock > {WALL_CLOCK_SECONDS}s")
@@ -285,6 +315,9 @@ class AgentRun:
                     }
                 )
 
+                if self._check_cancel():
+                    return
+
         self.status = "timeout"
         self.log_event("timeout", reason=f"exceeded MAX_ITERATIONS={MAX_ITERATIONS}")
 
@@ -304,7 +337,12 @@ class AgentRun:
             "log_count": len(self.logs),
             "duration_ms": int((self.finished_at - self.started_at) * 1000),
         }
-        name = "install.json" if self.status == "success" else "failure.json"
+        if self.status == "success":
+            name = "install.json"
+        elif self.status == "cancelled":
+            name = "cancelled.json"
+        else:
+            name = "failure.json"
         try:
             (self.workdir / name).write_text(json.dumps(out, indent=2, default=str))
         except Exception as e:

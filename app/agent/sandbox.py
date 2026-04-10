@@ -74,22 +74,86 @@ def walk_repo_tree(workdir: Path, max_files: int = 600) -> list[str]:
     return results
 
 
-async def clone_repo(owner: str, repo: str, workdir: Path, ref: str | None = None) -> None:
-    """Shallow-clone github.com/{owner}/{repo} into workdir. Raises on failure."""
+CLONE_TIMEOUT_SECONDS = 90
+
+
+async def clone_repo(
+    owner: str,
+    repo: str,
+    workdir: Path,
+    ref: str | None = None,
+    timeout: float = CLONE_TIMEOUT_SECONDS,
+) -> None:
+    """Shallow-clone github.com/{owner}/{repo} into workdir.
+
+    Raises on non-zero exit, on timeout (after killing the subprocess), or
+    if the task is cancelled.
+    """
     if workdir.exists():
         shutil.rmtree(workdir)
     workdir.parent.mkdir(parents=True, exist_ok=True)
     url = f"https://github.com/{owner}/{repo}.git"
-    args = ["git", "clone", "--depth=1"]
+    # --no-tags and GIT_LFS_SKIP_SMUDGE=1 keep slow-path LFS pulls and
+    # historical tags from blowing up clone time on large repos.
+    args = [
+        "git",
+        "-c", "http.postBuffer=524288000",
+        "clone",
+        "--depth=1",
+        "--no-tags",
+        "--single-branch",
+    ]
     if ref:
         args += ["--branch", ref]
     args += [url, str(workdir)]
+
+    log.info("cloning %s/%s (timeout=%ds)", owner, repo, timeout)
+    import os as _os
+    env = _os.environ.copy()
+    env["GIT_LFS_SKIP_SMUDGE"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"  # don't block on credential prompts
+
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
-    _, stderr = await proc.communicate()
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.warning("clone timeout for %s/%s after %ds, killing git", owner, repo, timeout)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        # Drain so the proc's fds don't leak.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
+        # Best-effort cleanup of the partial clone.
+        if workdir.exists():
+            shutil.rmtree(workdir, ignore_errors=True)
+        raise RuntimeError(
+            f"git clone timed out after {timeout}s for {owner}/{repo}"
+        )
+    except asyncio.CancelledError:
+        # Cooperative cancellation: kill the subprocess and re-raise so the
+        # runner can record status=cancelled.
+        log.info("clone cancelled for %s/%s", owner, repo)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
+        if workdir.exists():
+            shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
     if proc.returncode != 0:
         raise RuntimeError(
             f"git clone failed for {owner}/{repo}: {stderr.decode(errors='replace')}"
