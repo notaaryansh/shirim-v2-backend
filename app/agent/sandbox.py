@@ -54,7 +54,7 @@ def safe_path(workdir: Path, rel: str) -> Path | None:
     return full
 
 
-def walk_repo_tree(workdir: Path, max_files: int = 300) -> list[str]:
+def walk_repo_tree(workdir: Path, max_files: int = 600) -> list[str]:
     """Return a sorted list of relative file paths, skipping SKIP_DIRS and dotfiles."""
     results: list[str] = []
     for path in sorted(workdir.rglob("*")):

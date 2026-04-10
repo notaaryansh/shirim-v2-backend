@@ -30,14 +30,15 @@ class SearchResponse(BaseModel):
 
 
 # Match github.com/<owner>/<repo> with optional scheme, optional www,
-# optional trailing path/query/fragment.
+# optional trailing path/query/fragment. Also handles git@github.com:owner/repo.git.
 _GITHUB_URL_RE = re.compile(
     r"""
     ^\s*
-    (?:https?://)?              # optional scheme
-    (?:www\.)?                  # optional www
-    github\.com                 # the host
-    [/:]                        # path separator (also allow git@github.com:owner/repo)
+    (?:                                         # one of:
+        (?:https?://)?(?:www\.)?github\.com/    #   https://[www.]github.com/
+        |
+        git@github\.com:                        #   git@github.com:
+    )
     (?P<owner>[A-Za-z0-9][A-Za-z0-9-]{0,38})   # owner — github rules
     /
     (?P<repo>[A-Za-z0-9_.-]+?)                  # repo name

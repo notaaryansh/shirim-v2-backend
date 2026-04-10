@@ -64,13 +64,19 @@ WELL_KNOWN_SECRETS = {
 
 
 def _read_files(workdir: Path, tree: list[str]) -> dict[str, str]:
-    """Read the subset of files we care about into memory."""
+    """Read the subset of files we care about into memory.
+
+    Reads each INTERESTING_FILES path directly from disk rather than checking
+    whether it appears in `tree`. This matters for large repos where dep files
+    (go.mod, requirements.txt, package.json, etc.) would otherwise be truncated
+    out of the walk by the max_files cap. The `tree` arg is kept for API
+    symmetry but is no longer used here.
+    """
     out: dict[str, str] = {}
-    rel_set = set(tree)
     for name in INTERESTING_FILES:
-        if name not in rel_set:
-            continue
         full = workdir / name
+        if not full.exists() or not full.is_file():
+            continue
         try:
             data = full.read_bytes()[:MAX_FILE_BYTES]
             out[name] = data.decode("utf-8", errors="replace")
