@@ -12,19 +12,28 @@ You already have an `analysis.json` with declared deps, candidate entry points, 
 
 Workflow (single conversation, phases flow naturally):
 1. PHASE=install — run the language-specific install command. If it fails, read the error and either install a missing system dep (best-effort only), patch a small file issue with edit_file, or create a missing config file with create_file.
-2. PHASE=run — attempt a smoke run using one of the analysis candidate entry points. For web servers use `timeout 5` and look for "listening on" / successful bind. For CLIs try `--help`. For libraries try `python -c "import <pkg>"` or the language equivalent.
-3. PHASE=fix — on error, read the failing file, identify the minimal change, and use edit_file. DO NOT rewrite files. DO NOT restructure the repo. DO NOT swap the user's intent.
-4. On success → call report_success with run_command and entry_point.
-5. If stuck after a few fix attempts → call report_failure with the last error and which phase failed.
+2. PHASE=install (continued) — after deps are installed, READ THE README (use read_file on README.md) and look for:
+   - "Getting started" / "Quick start" / "From source" / "Development" sections
+   - Build steps (e.g. `pnpm build`, `npm run build`, `go build`, `cargo build`)
+   - First-run / onboarding commands (e.g. `openclaw onboard`, `npm run setup`, `python manage.py migrate`)
+   - Any required setup BEFORE the app can actually serve users
+   Follow these instructions. If there's a build step, run it. If there's an onboarding/setup command, note it for the run_command.
+3. PHASE=run — get the app RUNNING as fast as possible so the user can see it. Prioritize commands that start the app immediately WITHOUT interactive setup. If the app has flags like `--allow-unconfigured`, `--no-auth`, `--skip-setup`, `--dev`, or similar — USE THEM. Do NOT run interactive onboarding/wizard commands (they hang in headless mode). Do NOT try to fully configure the app — the user will configure it through the app's own UI after launch. For web servers use `timeout 5` and look for "listening on" / successful bind. For CLIs try `--help`.
+4. PHASE=fix — on error, read the failing file, identify the minimal change, and use edit_file. DO NOT rewrite files. DO NOT restructure the repo. DO NOT swap the user's intent.
+5. On success → call report_success. CRITICAL: the `run_command` you report must be the command a FIRST-TIME USER would run to actually use the app — NOT a smoke test, NOT `--help`, NOT `--version`. If the README says "run `X onboard`" or "run `X setup`" before the app is usable, report THAT as the run_command. If the app is a web server, report the command that starts the server (without `timeout`). The user will execute this command verbatim to launch the app.
+6. If stuck after a few fix attempts → call report_failure with the last error and which phase failed.
 
 IMPORTANT rules:
 - Tag every bash call with a `phase` argument ("install", "run", or "fix"). This drives the log stream and stuck detection.
+- ALWAYS read README.md early in the process (right after install, before attempting to run). The README is the single most reliable source of truth for how to build and run the project. Do NOT guess — read it.
 - Never operate outside the working directory.
 - Never run destructive commands (no `rm -rf /`, no `sudo`, no touching ~/ anything).
 - edit_file is diff-only: supply a UNIQUE substring for `old_string`. If the tool reports multiple matches, add surrounding context. If it reports zero matches, re-read the file with read_file and copy an exact substring. Do NOT regenerate whole files.
 - create_file only works for files that don't exist yet. For existing files use edit_file.
 - If the repo needs real API keys, create a .env with PLACEHOLDER values and list the required keys in env_vars_used on success. NEVER fabricate real credentials.
-- Be efficient. Max 25 iterations total. If you're in phase=fix and the same error keeps coming back, call report_failure — don't loop forever.
+- The `run_command` in report_success is what gets executed when the user clicks "Run" later. It must be the REAL command, not a test. No `timeout`, no `--help`, no `|| true`. If the app needs a build step first, include it: e.g. `pnpm build && pnpm start`.
+- CRITICAL: When you run a server command and it TIMES OUT (exit_code=-1, stderr says "timeout after Ns"), that means the server STARTED SUCCESSFULLY and ran for N seconds without crashing. DO NOT retry the same command. Instead, call report_success immediately with that command as the run_command. A timeout on a server is SUCCESS, not failure.
+- Be efficient. Max 40 iterations total. If you're in phase=fix and the same error keeps coming back, call report_failure — don't loop forever.
 """
 
 
@@ -72,8 +81,7 @@ def build_initial_user_message(
             f"{', '.join(sorted(secret_names))}. Use them directly."
         )
 
-    # Trim the analysis down to the fields the LLM actually needs so we don't
-    # waste 2k tokens on a file_tree it won't read.
+    # Trim the analysis down to the fields the LLM actually needs.
     trimmed_analysis = {
         "language": analysis.get("language"),
         "dep_files": analysis.get("dep_files"),
@@ -84,6 +92,15 @@ def build_initial_user_message(
         "required_env_vars": analysis.get("required_env_vars"),
     }
 
+    # Include the README excerpt so the LLM doesn't waste a tool call reading it.
+    readme_excerpt = (analysis.get("readme_excerpt") or "").strip()
+    readme_section = ""
+    if readme_excerpt:
+        readme_section = (
+            f"\n\nREADME excerpt (first 2000 chars — read the full file if you need more):\n"
+            f"```\n{readme_excerpt}\n```"
+        )
+
     return (
         f"Repository: {owner}/{repo}\n"
         f"Working directory: {workdir}\n"
@@ -93,6 +110,8 @@ def build_initial_user_message(
         f"```json\n{json.dumps(trimmed_analysis, indent=2)}\n```\n\n"
         f"Suggested install command (try this first): `{install_cmd_hint}`\n"
         f"Suggested smoke-run candidates:\n  - " + "\n  - ".join(smoke_run_hints)
+        + readme_section
         + secret_note
-        + "\n\nStart with PHASE=install. Good luck."
+        + "\n\nStart with PHASE=install. Read the README carefully for build steps and "
+        "first-run/onboarding commands before attempting to run. Good luck."
     )

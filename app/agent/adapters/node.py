@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import json
+import logging
+import subprocess
 from pathlib import Path
 
 from .base import EntryPoint, ParsedDeps, SandboxInfo
+
+log = logging.getLogger(__name__)
 
 
 class NodeAdapter:
@@ -50,15 +54,21 @@ class NodeAdapter:
             for k in ("dependencies", "devDependencies"):
                 for name, ver in (pkg.get(k) or {}).items():
                     deps.append(f"{name}@{ver}")
-            # scripts → entry-point candidates
-            for name, cmd in (pkg.get("scripts") or {}).items():
-                entry_points.append(
-                    EntryPoint(
-                        kind="package_json_script",
-                        value=f"{pm} run {name}",
-                        source=f"package.json scripts.{name}: {cmd}",
+            # scripts → entry-point candidates. Only include likely-useful ones —
+            # large projects (e.g. OpenClaw) can have 200+ scripts and flooding
+            # the LLM with all of them wastes tokens.
+            RUN_SCRIPTS = {"start", "dev", "serve", "server", "preview", "watch"}
+            BUILD_SCRIPTS = {"build", "compile", "bundle"}
+            all_scripts = pkg.get("scripts") or {}
+            for name, cmd in all_scripts.items():
+                if name in RUN_SCRIPTS or name in BUILD_SCRIPTS:
+                    entry_points.append(
+                        EntryPoint(
+                            kind="package_json_script",
+                            value=f"{pm} run {name}",
+                            source=f"package.json scripts.{name}: {cmd[:80]}",
+                        )
                     )
-                )
             extras["scripts"] = pkg.get("scripts") or {}
             main = pkg.get("main")
             if main:
@@ -120,16 +130,64 @@ class NodeAdapter:
     def bootstrap_sandbox(self, workdir: Path) -> SandboxInfo:
         prefix = workdir / ".shirim-npm-prefix"
         prefix.mkdir(parents=True, exist_ok=True)
-        # Keep npm from touching ~/.npm
         cache = workdir / ".shirim-npm-cache"
         cache.mkdir(parents=True, exist_ok=True)
+
+        notes: list[str] = [f"npm prefix: {prefix}", f"npm cache: {cache}"]
+        path_prepend: list[str] = []
+
+        # Detect which package manager the repo needs and install it if missing.
+        pm = self._pick_package_manager(
+            {f: "" for f in ("pnpm-lock.yaml", "yarn.lock", "package-lock.json")
+             if (workdir / f).exists()}
+        )
+
+        bin_dir = str(prefix / "bin")
+        path_prepend.append(bin_dir)
+
+        def _is_installed(cmd: str) -> bool:
+            try:
+                return subprocess.run([cmd, "-v"], capture_output=True).returncode == 0
+            except FileNotFoundError:
+                return False
+
+        sandbox_env = {
+            **__import__("os").environ,
+            "NPM_CONFIG_PREFIX": str(prefix),
+            "NPM_CONFIG_CACHE": str(cache),
+            "PATH": bin_dir + __import__("os").pathsep + __import__("os").environ.get("PATH", ""),
+        }
+
+        if pm == "pnpm" and not _is_installed("pnpm"):
+            log.info("installing pnpm into sandbox prefix")
+            r = subprocess.run(
+                ["npm", "install", "-g", "pnpm"],
+                capture_output=True, text=True, env=sandbox_env,
+            )
+            if r.returncode == 0:
+                notes.append("installed pnpm")
+            else:
+                log.warning("pnpm install failed: %s", r.stderr[:300])
+                notes.append(f"pnpm install failed: {r.stderr[:200]}")
+        elif pm == "yarn" and not _is_installed("yarn"):
+            log.info("installing yarn into sandbox prefix")
+            r = subprocess.run(
+                ["npm", "install", "-g", "yarn"],
+                capture_output=True, text=True, env=sandbox_env,
+            )
+            if r.returncode == 0:
+                notes.append("installed yarn")
+            else:
+                log.warning("yarn install failed: %s", r.stderr[:300])
+                notes.append(f"yarn install failed: {r.stderr[:200]}")
+
         return SandboxInfo(
             env={
                 "NPM_CONFIG_PREFIX": str(prefix),
                 "NPM_CONFIG_CACHE": str(cache),
             },
-            path_prepend=[],
-            notes=[f"npm prefix: {prefix}", f"npm cache: {cache}"],
+            path_prepend=path_prepend,
+            notes=notes,
         )
 
     def install_cmd(self, parsed: ParsedDeps) -> str:

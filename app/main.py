@@ -9,6 +9,7 @@ from .routes import install as install_routes
 from .routes import launch as launch_routes
 from .routes import repos
 from .routes import search as search_routes
+from .routes import secrets as secrets_routes
 
 logging.basicConfig(level=logging.INFO)
 
@@ -24,9 +25,13 @@ app.add_middleware(
 
 app.include_router(repos.router, prefix="/api")
 app.include_router(auth_routes.router, prefix="/api")
-app.include_router(install_routes.router, prefix="/api")
+# launch_routes MUST come before install_routes — both share /api/v1/install/
+# prefix, and install's POST /{owner}/{repo} wildcard would swallow
+# launch's POST /{install_id}/run if registered first.
 app.include_router(launch_routes.router, prefix="/api")
+app.include_router(install_routes.router, prefix="/api")
 app.include_router(search_routes.router, prefix="/api")
+app.include_router(secrets_routes.router, prefix="/api")
 
 
 @app.get("/health")

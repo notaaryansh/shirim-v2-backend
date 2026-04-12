@@ -29,7 +29,7 @@ INTERESTING_FILES = {
     ".env.example", ".env.sample",
     "Makefile",
 }
-MAX_FILE_BYTES = 64 * 1024  # 64KB per file — plenty for config/metadata files.
+MAX_FILE_BYTES = 256 * 1024  # 256KB per file — package.json can be 100KB+ for large projects.
 
 # Env-var-shaped tokens in code/docs.
 ENV_VAR_RE = re.compile(

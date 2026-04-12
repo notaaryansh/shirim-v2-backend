@@ -1,4 +1,9 @@
-"""/api/v1/install/* — agentic install loop endpoints."""
+"""/api/v1/install/* — agentic install loop endpoints.
+
+IMPORTANT: The POST /{owner}/{repo} wildcard route MUST be the LAST route
+registered in this file. Otherwise it swallows requests meant for
+/{install_id}/cancel, /{install_id}/progress, etc.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -35,40 +40,7 @@ class InstallRequest(BaseModel):
     ref: Optional[str] = None  # branch/tag, defaults to the repo's default branch
 
 
-@router.post("/{owner}/{repo}")
-async def start_install(
-    owner: str,
-    repo: str,
-    body: InstallRequest | None = None,
-    user: User = Depends(get_current_user),
-):
-    # Dedup: if the same user already has a non-terminal install for this
-    # exact repo, return the existing install_id. Prevents React StrictMode
-    # double-invocation and accidental double-clicks from spawning zombies.
-    for existing_id, existing in _installs.items():
-        if (
-            existing.owner == owner
-            and existing.repo == repo
-            and not _is_terminal(existing)
-        ):
-            log.info(
-                "dedup: returning existing install %s for %s/%s",
-                existing_id, owner, repo,
-            )
-            return {"install_id": existing_id, "deduped": True}
-
-    install_id = uuid.uuid4().hex[:12]
-    run = AgentRun(
-        install_id=install_id,
-        owner=owner,
-        repo=repo,
-        ref=(body.ref if body else None),
-    )
-    _installs[install_id] = run
-    # Store the task handle so cancel can reach it.
-    _tasks[install_id] = asyncio.create_task(run.run())
-    return {"install_id": install_id}
-
+# ---------- Specific routes FIRST (have literal path segments) ----------
 
 @router.get("/{install_id}")
 async def get_install(install_id: str, user: User = Depends(get_current_user)):
@@ -123,7 +95,7 @@ async def stream_install(install_id: str, user: User = Depends(get_current_user)
             while idx < n:
                 yield f"data: {json.dumps(run.logs[idx], default=str)}\n\n"
                 idx += 1
-            if run.status in ("success", "failure", "timeout", "error"):
+            if run.status in ("success", "failure", "timeout", "cancelled", "error"):
                 break
             await asyncio.sleep(0.4)
 
@@ -147,9 +119,6 @@ async def cancel_install(install_id: str, user: User = Depends(get_current_user)
     task = _tasks.get(install_id)
     if task and not task.done():
         task.cancel()
-        # Give the runner a short window to observe the cancel flag and
-        # shut down cleanly. We don't await task.wait() because the caller
-        # is polling /progress anyway.
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=2)
         except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -181,3 +150,41 @@ async def delete_install(install_id: str, user: User = Depends(get_current_user)
     if not run and not removed:
         raise HTTPException(404, "install not found")
     return {"ok": True, "removed": removed, "stopped_runs": stopped_runs}
+
+
+# ---------- Wildcard route LAST (catches any two-segment path) ----------
+
+@router.post("/{owner}/{repo}")
+async def start_install(
+    owner: str,
+    repo: str,
+    body: InstallRequest | None = None,
+    user: User = Depends(get_current_user),
+):
+    """Start an install. This route MUST be last in the file — it matches any
+    POST to /{x}/{y} and would swallow /cancel, /run, etc. if registered first.
+    """
+    # Dedup: if the same user already has a non-terminal install for this
+    # exact repo, return the existing install_id.
+    for existing_id, existing in _installs.items():
+        if (
+            existing.owner == owner
+            and existing.repo == repo
+            and not _is_terminal(existing)
+        ):
+            log.info(
+                "dedup: returning existing install %s for %s/%s",
+                existing_id, owner, repo,
+            )
+            return {"install_id": existing_id, "deduped": True}
+
+    install_id = uuid.uuid4().hex[:12]
+    run = AgentRun(
+        install_id=install_id,
+        owner=owner,
+        repo=repo,
+        ref=(body.ref if body else None),
+    )
+    _installs[install_id] = run
+    _tasks[install_id] = asyncio.create_task(run.run())
+    return {"install_id": install_id}

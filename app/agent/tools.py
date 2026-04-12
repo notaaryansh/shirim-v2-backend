@@ -42,7 +42,15 @@ def _trim(s: str, cap: int) -> str:
 
 
 def bash(ctx: ToolContext, command: str, timeout: int | None = None, phase: str | None = None) -> dict:
-    """Run a shell command in workdir with sandbox env + secrets injected."""
+    """Run a shell command in workdir with sandbox env + secrets injected.
+
+    Uses start_new_session=True so the entire process tree (shell + any children
+    it spawns, like `node server.js`) is in a dedicated session. On timeout we
+    kill the whole session group, preventing orphaned child processes that would
+    keep stdout open and hang the read forever.
+    """
+    import signal
+
     timeout = min(timeout or ctx.default_timeout, ctx.max_timeout)
     env = os.environ.copy()
     env.update(ctx.sandbox_env)
@@ -50,26 +58,79 @@ def bash(ctx: ToolContext, command: str, timeout: int | None = None, phase: str 
         env["PATH"] = os.pathsep.join(ctx.path_prepend + [env.get("PATH", "")])
     env.update(ctx.secrets)
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
             cwd=str(ctx.workdir),
             env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
+        try:
+            stdout_b, stderr_b = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Capture whatever stdout/stderr was buffered BEFORE killing.
+            # This is critical: for servers, the "Listening on http://..."
+            # line is in this buffer. Without it, the agent can't see the
+            # server started.
+            partial_stdout = b""
+            partial_stderr = b""
+            try:
+                # Non-blocking read of whatever's in the pipe buffer.
+                import select
+                for pipe, buf_name in [(proc.stdout, "stdout"), (proc.stderr, "stderr")]:
+                    if pipe and select.select([pipe], [], [], 0.1)[0]:
+                        chunk = os.read(pipe.fileno(), 65536)
+                        if buf_name == "stdout":
+                            partial_stdout = chunk
+                        else:
+                            partial_stderr = chunk
+            except Exception:
+                pass
+
+            # Kill the entire process group (shell + children).
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            # Close pipes to prevent leaks.
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+
+            stdout_text = partial_stdout.decode("utf-8", errors="replace")
+            return {
+                "exit_code": -1,
+                "stdout": _trim(stdout_text, BASH_OUTPUT_CAP),
+                "stderr": f"<timeout after {timeout}s>",
+                "phase": phase,
+                "note": (
+                    f"Command ran for {timeout}s without crashing, then was killed. "
+                    "If this is a server/daemon, that means it STARTED SUCCESSFULLY — "
+                    "do NOT retry. Call report_success with this as the run_command."
+                ),
+            }
         return {
             "exit_code": proc.returncode,
-            "stdout": _trim(proc.stdout, BASH_OUTPUT_CAP),
-            "stderr": _trim(proc.stderr, BASH_OUTPUT_CAP),
-            "phase": phase,
-        }
-    except subprocess.TimeoutExpired as e:
-        return {
-            "exit_code": -1,
-            "stdout": _trim(e.stdout.decode() if e.stdout else "", BASH_OUTPUT_CAP),
-            "stderr": f"<timeout after {timeout}s>",
+            "stdout": _trim(stdout_b.decode("utf-8", errors="replace"), BASH_OUTPUT_CAP),
+            "stderr": _trim(stderr_b.decode("utf-8", errors="replace"), BASH_OUTPUT_CAP),
             "phase": phase,
         }
     except Exception as e:

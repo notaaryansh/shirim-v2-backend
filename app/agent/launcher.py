@@ -156,13 +156,16 @@ def _reader(handle: RunHandle) -> None:
             handle.log_tail.append({"ts": time.time(), "line": line})
             if handle.url is None:
                 url, port = _extract_url_port(line)
-                if url:
-                    handle.url = url
+                if url and port:
+                    # Always use the root URL — the raw match might be an
+                    # internal API path (e.g. /__openclaw__/canvas/) that
+                    # requires auth. The main UI is at the root.
+                    handle.url = f"http://localhost:{port}/"
                     handle.port = port
                     handle.status = "running"
                     log.info(
                         "[run %s] url detected: %s (from: %s)",
-                        handle.run_id, url, line[:120],
+                        handle.run_id, handle.url, line[:120],
                     )
     except Exception as e:
         log.warning("[run %s] reader thread error: %s", handle.run_id, e)

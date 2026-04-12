@@ -14,6 +14,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from .. import vault
 from ..agent.adapters import get_adapter
 from ..agent.launcher import (
     RunHandle,
@@ -136,7 +137,10 @@ async def run_install(
     except Exception as e:
         raise HTTPException(500, f"sandbox rebuild failed: {e}")
 
-    # 3. Spawn
+    # 3. Load vault secrets so the app gets API keys injected as env vars
+    secrets = vault.load()
+
+    # 4. Spawn
     wait_for_url = body.wait_for_url if (body and body.wait_for_url is not None) else 30.0
     try:
         handle = await asyncio.to_thread(
@@ -146,6 +150,7 @@ async def run_install(
             cwd=workdir,
             sandbox_env=sandbox_info.env,
             path_prepend=sandbox_info.path_prepend,
+            secrets=secrets,
             wait_for_url=wait_for_url,
         )
     except Exception as e:
