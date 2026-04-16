@@ -57,6 +57,9 @@ def bash(ctx: ToolContext, command: str, timeout: int | None = None, phase: str 
     if ctx.path_prepend:
         env["PATH"] = os.pathsep.join(ctx.path_prepend + [env.get("PATH", "")])
     env.update(ctx.secrets)
+    # Suppress dev-server browser auto-open during smoke tests (CRA, Vite, etc.).
+    # The user's real browser shouldn't pop up just because the agent ran `yarn start`.
+    env.setdefault("BROWSER", "none")
     try:
         proc = subprocess.Popen(
             command,

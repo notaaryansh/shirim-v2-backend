@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 40
 WALL_CLOCK_SECONDS = 8 * 60
-MODEL = "gpt-5.4-nano"
+MODEL = "gpt-5.4-mini"
 TEMPERATURE = 0.2
 STUCK_THRESHOLD = 2  # N consecutive fix turns with identical stderr_hash → stuck
 

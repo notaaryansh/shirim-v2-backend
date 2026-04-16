@@ -119,23 +119,27 @@ async def run_install(
             "no run_command available — pass one explicitly in the request body",
         )
 
-    # 2. Determine the language + rebuild sandbox env
+    # 2. Determine the language + rebuild sandbox env.
+    # Fallback installs (no adapter matched, e.g. Flutter) won't have a
+    # language — in that case we skip sandbox bootstrap and run with the
+    # system env, matching what the fallback install path itself did.
     analysis = install_data.get("analysis") or {}
     language = analysis.get("language")
-    if not language:
-        raise HTTPException(
-            409, "install has no language in analysis; can't rebuild sandbox"
-        )
-    try:
-        adapter = get_adapter(language)
-    except ValueError as e:
-        raise HTTPException(500, f"unknown language {language}: {e}")
-
     workdir = INSTALLS_DIR / install_id
-    try:
-        sandbox_info = await asyncio.to_thread(adapter.bootstrap_sandbox, workdir)
-    except Exception as e:
-        raise HTTPException(500, f"sandbox rebuild failed: {e}")
+    if language:
+        try:
+            adapter = get_adapter(language)
+        except ValueError as e:
+            raise HTTPException(500, f"unknown language {language}: {e}")
+        try:
+            sandbox_info = await asyncio.to_thread(adapter.bootstrap_sandbox, workdir)
+        except Exception as e:
+            raise HTTPException(500, f"sandbox rebuild failed: {e}")
+        sandbox_env = sandbox_info.env
+        path_prepend = sandbox_info.path_prepend
+    else:
+        sandbox_env = {}
+        path_prepend = []
 
     # 3. Load vault secrets so the app gets API keys injected as env vars
     secrets = vault.load()
@@ -148,8 +152,8 @@ async def run_install(
             install_id=install_id,
             command=command,
             cwd=workdir,
-            sandbox_env=sandbox_info.env,
-            path_prepend=sandbox_info.path_prepend,
+            sandbox_env=sandbox_env,
+            path_prepend=path_prepend,
             secrets=secrets,
             wait_for_url=wait_for_url,
         )

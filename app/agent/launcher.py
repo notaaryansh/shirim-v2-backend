@@ -232,6 +232,9 @@ def start_run(
         env.update(secrets)
     # Force line-buffered output where possible.
     env.setdefault("PYTHONUNBUFFERED", "1")
+    # Don't auto-open the user's browser when a Vite/CRA dev server starts —
+    # the launcher already extracts the URL and the frontend exposes it.
+    env.setdefault("BROWSER", "none")
 
     log.info("[run %s] starting %r in %s", run_id, normalised, cwd)
 
