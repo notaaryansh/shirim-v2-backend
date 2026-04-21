@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import FRONTEND_ORIGINS
 from .routes import auth as auth_routes
+from .routes import edit as edit_routes
 from .routes import install as install_routes
 from .routes import launch as launch_routes
 from .routes import repos
@@ -25,9 +26,10 @@ app.add_middleware(
 
 app.include_router(repos.router, prefix="/api")
 app.include_router(auth_routes.router, prefix="/api")
-# launch_routes MUST come before install_routes — both share /api/v1/install/
-# prefix, and install's POST /{owner}/{repo} wildcard would swallow
-# launch's POST /{install_id}/run if registered first.
+# edit_routes and launch_routes MUST come before install_routes — all share
+# /api/v1/install/ prefix, and install's POST /{owner}/{repo} wildcard would
+# swallow their POST /{install_id}/edit and /{install_id}/run if registered first.
+app.include_router(edit_routes.router, prefix="/api")
 app.include_router(launch_routes.router, prefix="/api")
 app.include_router(install_routes.router, prefix="/api")
 app.include_router(search_routes.router, prefix="/api")
